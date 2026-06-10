@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .cache/
 .pytest_cache/
+.alert_state.json
+alerts.json

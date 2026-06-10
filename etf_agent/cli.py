@@ -7,6 +7,8 @@ Usage:
     python -m etf_agent scan                 # analyze whole watchlist
     python -m etf_agent scan --ticker SOXL   # analyze one ticker
     python -m etf_agent watch --interval 30  # re-scan every 30 minutes
+    python -m etf_agent alerts init          # create alerts.json template
+    python -m etf_agent alerts test          # send a test notification
 """
 
 import argparse
@@ -14,7 +16,7 @@ import sys
 import time
 
 from . import MAX_WATCHLIST_SIZE
-from . import analysis, data, watchlist
+from . import alerts, analysis, data, watchlist
 
 
 def _fmt_pct(x: float) -> str:
@@ -45,7 +47,7 @@ def _print_report(results: list[analysis.Analysis]) -> None:
     print("Not financial advice — leveraged ETFs can lose most of their value.")
 
 
-def cmd_scan(tickers: list[str]) -> int:
+def cmd_scan(tickers: list[str], send_alerts: bool = False) -> int:
     if not tickers:
         print("Watchlist is empty. Add tickers first: python -m etf_agent add SOXL TQQQ")
         return 1
@@ -58,6 +60,12 @@ def cmd_scan(tickers: list[str]) -> int:
             failures.append(f"{t}: {e}")
     if results:
         _print_report(results)
+        if send_alerts:
+            sent, alert_failures = alerts.run_alerts(results)
+            if sent:
+                print(f"Alert sent via: {', '.join(sent)}")
+            for f in alert_failures:
+                print(f"WARNING — alert channel failed — {f}", file=sys.stderr)
     for f in failures:
         print(f"WARNING — could not analyze {f}", file=sys.stderr)
     return 0 if results else 1
@@ -83,10 +91,19 @@ def main(argv: list[str] | None = None) -> int:
     p_scan.add_argument("--ticker", help="analyze a single ticker instead")
     p_scan.add_argument("--no-cache", action="store_true",
                         help="force fresh download even if cached today")
+    p_scan.add_argument("--alerts", action="store_true",
+                        help="notify if a ticker crossed into BUY territory")
 
     p_watch = sub.add_parser("watch", help="re-scan on an interval (Ctrl-C to stop)")
     p_watch.add_argument("--interval", type=int, default=30,
                          help="minutes between scans (default 30)")
+    p_watch.add_argument("--no-alerts", action="store_true",
+                         help="disable buy-zone notifications while watching")
+
+    p_alerts = sub.add_parser("alerts", help="manage alert configuration")
+    p_alerts.add_argument("action", choices=["init", "test"],
+                          help="init: write alerts.json template; "
+                               "test: send a test notification")
 
     args = parser.parse_args(argv)
 
@@ -116,14 +133,34 @@ def main(argv: list[str] | None = None) -> int:
             for p in data.CACHE_DIR.glob("*.csv"):
                 p.unlink()
         tickers = [args.ticker.upper()] if args.ticker else watchlist.load()
-        return cmd_scan(tickers)
+        return cmd_scan(tickers, send_alerts=args.alerts)
 
     if args.command == "watch":
         print(f"Watching every {args.interval} min — Ctrl-C to stop.")
         while True:
             print(f"\n=== Scan at {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
-            cmd_scan(watchlist.load())
+            cmd_scan(watchlist.load(), send_alerts=not args.no_alerts)
             time.sleep(args.interval * 60)
+
+    if args.command == "alerts":
+        if args.action == "init":
+            if alerts.init_config():
+                print(f"Wrote template to {alerts.CONFIG_PATH} — edit it to "
+                      "enable channels. SMTP password goes in the env var "
+                      "named by password_env, not in the file.")
+            else:
+                print(f"{alerts.CONFIG_PATH} already exists; not overwriting.")
+            return 0
+        # test: exercise every enabled channel
+        sent, failures = alerts.dispatch(
+            "ETF agent: test alert",
+            "If you can read this, alerting works.",
+            alerts.load_config(),
+        )
+        print(f"Sent via: {', '.join(sent) or '(no channels enabled)'}")
+        for f in failures:
+            print(f"FAILED — {f}", file=sys.stderr)
+        return 0 if not failures else 1
 
     return 0
 
